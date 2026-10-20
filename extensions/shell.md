@@ -1,514 +1,328 @@
-# HRTOS Shell 模块使用说明
+# HRTOS Shell 模块使用手册
 
-## 模块介绍
+## 模块概述
 
-HRTOS Shell 模块为嵌入式实时操作系统提供轻量级命令行交互接口，通过 UART 串口实现人机交互。
+HRTOS Shell 是运行在 HRTOS 上的轻量级命令行交互模块。用户通过 UART 串口输入命令，Shell 完成输入缓冲、命令解析、命令匹配和命令执行，并将执行结果输出到串口终端。
 
-### 为什么 RTOS 需要 Shell
+Shell 当前提供五个内置主命令：
 
-在嵌入式系统开发中，Shell 提供了便捷的系统调试和监控手段：
+| 命令 | 功能 |
+|---|---|
+| `help` | 显示命令列表 |
+| `version` | 显示系统版本与配置信息 |
+| `task` | 查看任务状态、挂起和恢复任务、修改任务优先级 |
+| `wait` | 查看处于等待状态的任务 |
+| `msg` | 查看消息队列状态 |
 
-- **系统调试**：无需重新烧录程序即可查看系统状态
-- **状态查看**：实时监控任务、信号量、消息队列等内核对象
-- **参数控制**：动态调整系统参数和配置
-- **功能测试**：快速验证系统功能模块
+Shell 将交互功能与内核管理接口结合，可用于开发调试、运行状态检查、现场故障诊断及功能验证。
 
-### HRTOS Shell 应用场景
+需要注意：Shell 是系统调试与管理接口，不等同于完整的命令解释器。当前实现主要支持以空格分隔参数的简单命令，不提供引号、转义、管道或命令历史等功能。
 
-Shell 模块特别适用于以下场景：
+## 模块架构
 
-- 开发阶段的系统调试
-- 现场故障诊断
-- 系统参数动态配置
-- 用户交互界面
-- 自动化测试脚本执行
+Shell 的主要处理流程如下：
 
----
-
-## Shell 模块架构
-
-Shell 模块采用分层架构设计，各层职责清晰：
-
+```text
+UART 接收数据
+      │
+      ▼
+uart_isr()
+      │
+      ├── 普通字符：写入输入缓冲区
+      ├── 退格字符：回退输入位置
+      └── 回车/换行：设置接收事件
+                         │
+                         ▼
+                   shell_process()
+                         │
+                         ▼
+                  shell_parse_line()
+                         │
+                         ▼
+                  shell_cmd_execute()
+                         │
+                         ▼
+                  对应的命令处理函数
+                         │
+                         ▼
+                    UART 输出结果
 ```
-用户输入
-    ↓
-UART 接口
-    ↓
-Shell 输入处理
-    ↓
-命令解析
-    ↓
-命令匹配
-    ↓
-命令执行
+
+### 文件职责
+
+| 文件或模块 | 主要职责 |
+|---|---|
+| `shell.h` | Shell 配置宏、全局变量和公共接口声明 |
+| `shell_cmd.h` | 命令处理函数及命令表结构定义 |
+| Shell 初始化模块 | 清理输入状态并显示提示符 |
+| UART 接收模块 | 处理接收到的字符并提交输入事件 |
+| Shell 核心模块 | 周期处理、命令行分割和参数生成 |
+| `shell_port.c` | 提供串口字符串输出适配 |
+| Shell 格式化输出模块 | 提供轻量级 `shell_printf()` |
+| `shell_cmd.c` | 定义命令表并分派命令 |
+| `help` 命令模块 | 显示支持的主命令 |
+| `version` 命令模块 | 输出系统版本信息 |
+| `task` 命令模块 | 任务查询与管理 |
+| `wait` 命令模块 | 查询等待状态 |
+| `msg` 命令模块 | 查询消息队列信息 |
+| BSP UART 模块 | 配置 UART、Timer1 和串口发送 |
+
+具体目录名称以实际工程组织为准。
+
+## 配置参数与全局变量
+
+### 配置宏
+
+相关定义位于 `shell.h`：
+
+```c
+#define SHELL_MAX_LINE_LEN    32
+#define SHELL_MAX_ARGC        8
+#define SHELL_EVENT_RX        1
+
+#define SHELL_CMD_COUNT       5
 ```
 
-### 文件职责说明
+| 宏 | 默认值 | 说明 |
+|---|---:|---|
+| `SHELL_MAX_LINE_LEN` | 32 | 输入缓冲区长度，包含字符串结束符所需空间 |
+| `SHELL_MAX_ARGC` | 8 | 最多保存的命令参数数量，包含主命令 |
+| `SHELL_EVENT_RX` | 1 | Shell 输入完成后使用的事件标识 |
+| `SHELL_CMD_COUNT` | 5 | 命令表中的主命令数量 |
 
-#### 核心文件
+在当前配置下，输入缓冲区最多保存 31 个字符，最后一个字节用于字符串结束符 `'\0'`。参数数组最多保存 8 个参数。
 
-- **shell.c**：Shell 核心逻辑，包含初始化、输入处理、命令解析
-- **shell_cmd.c**：命令表定义和命令执行调度
-- **shell_port.c**：硬件移植接口，实现字符输入输出
+如果需要增加输入长度或参数数量，应同步评估 RAM 占用和解析函数的适配情况。
 
-#### Shell 子目录
+### 全局变量
 
-- **init.c**：Shell 初始化
-- **input.c**：UART 中断输入处理
-- **main.c**：Shell 任务主循环
-- **parse_line.c**：命令行解析，生成 argc/argv 参数
-- **printf.c**：格式化输出函数
-- **prompt.c**：命令提示符显示
-- **shell.c**：Shell 周期处理
-- **shell_port.c**：移植接口实现
+```c
+extern char shell_line[SHELL_MAX_LINE_LEN];
+extern unsigned char shell_pos;
+```
 
-#### Cmd 子目录
+- `shell_line`：保存当前接收到的命令行。
+- `shell_pos`：指示下一次写入字符的位置。
 
-- **execute.c**：命令执行逻辑和字符串比较
-- **help.c**：help 命令实现
-- **task.c**：task 命令实现（任务管理）
-- **msg.c**：msg 命令实现（消息队列管理）
-- **wait.c**：wait 命令实现（等待状态查看）
-- **version.c**：version 命令实现（版本信息）
-- **shell_cmd.c**：命令表定义
+串口接收处理与 Shell 任务都会访问这些变量，因此它们属于中断和任务之间共享的状态。修改输入逻辑时，应特别注意缓冲区一致性以及中断与任务之间的同步。
 
----
+## 初始化与启动
 
-## HRTOS Shell 运行流程
+### 当前初始化流程
 
-结合 main.c，Shell 的启动和运行流程如下：
+当前应用入口执行以下操作：
+
+```c
+void hrtos_main(void)
+{
+    shell_init();
+    bsp_uart_init();
+    os_event_init(SHELL_EVENT_RX);
+
+    os_task_create(shell_task, 1, 6, 6);
+    os_task_create(uart_isr, 0, 9, 0);
+
+    os_task_create(demo_task1, 2, 1, 2);
+    os_task_create(demo_task2, 3, 2, 2);
+}
+```
+
+以上参数应结合 HRTOS 当前版本的 `os_task_create()` 接口解释。这里展示的是工程中的实际调用，不代表所有参数均适用于其他版本。
+
+| 任务入口 | ID | 优先级 | 堆栈参数 |
+|---|---:|---:|---:|
+| `uart_isr` | 0 | 9 | 0 |
+| `shell_task` | 1 | 6 | 6 |
+| `demo_task1` | 2 | 1 | 2 |
+| `demo_task2` | 3 | 2 | 2 |
+
+表中堆栈参数的实际含义及单位应以 HRTOS 内核接口定义为准。`uart_isr` 的注册方式属于当前工程的设计，不能仅凭函数名称推断它就是传统意义上由硬件直接调用的 ISR；实际中断入口和分派机制应以 HRTOS 中断模块为准。
 
 ### Shell 初始化
 
 ```c
-void hrtos_main(void)
+void shell_init(void)
 {
-    shell_init();           // 初始化 Shell
-    bsp_uart_init();        // 初始化 UART
-    os_event_init(SHELL_EVENT_RX);  // 初始化 Shell 事件
-    
-    // 创建 Shell 任务
-    os_task_create(shell_task, 1, 1, 6);
-    
-    // 创建 UART 中断任务
-    os_task_create(uart_isr, 0, 9, 0);
-}
-```
-
-### UART 初始化
-
-UART 配置在 `bsp_uart_init()` 中完成：
-
-```c
-void bsp_uart_init(void)
-{
-    SCON = 0x50;        // 8位数据，可变波特率
-    TMOD &= 0x0F;       // 设置定时器模式
-    TMOD |= 0x20;       // 定时器1模式2
-    TL1 = 0xFD;         // 设置定时初始值
-    TH1 = 0xFD;         // 设置定时初始值
-    ET1 = 0;            // 禁止定时器中断
-    TR1 = 1;            // 定时器1开始计时
-    EA = 1;             // 开总中断
-    ES = 1;             // 开串口中断
-}
-```
-
-### 输入接收
-
-UART 中断接收字符：
-
-```c
-void uart_isr(void) // interrupt 4
-{
-    char ch;
-    
-    if (RI)
-    {
-        ch = SBUF;
-        RI = 0;
-        
-        // 回车处理
-        if ((ch == '\r') || (ch == '\n'))
-        {
-            shell_line[shell_pos] = '\0';
-            if (shell_pos > 0)
-            {
-                os_event_set_from_isr(SHELL_EVENT_RX);
-            }
-        }
-        // 退格处理
-        else if ((ch == '\b') || (ch == 0x7F))
-        {
-            if (shell_pos > 0)
-            {
-                shell_pos--;
-            }
-        }
-        // 普通字符
-        else if (shell_pos < (SHELL_MAX_LINE_LEN - 1))
-        {
-            shell_line[shell_pos++] = ch;
-        }
-    }
-}
-```
-
-### 命令解析
-
-Shell 任务周期处理：
-
-```c
-static void shell_task(void)
-{
-    shell_init();
-    
-    while(1)
-    {
-        shell_process();
-        os_delay(10);
-    }
-}
-```
-
-### 命令执行
-
-```c
-void shell_process(void)
-{
-    os_event_wait(SHELL_EVENT_RX, 0);
-    
-    shell_parse_line(shell_line);
-    
     shell_pos = 0;
     shell_line[0] = '\0';
-    
-    os_event_delete(SHELL_EVENT_RX);
-    
     shell_prompt();
 }
 ```
 
----
+`shell_init()` 将输入位置复位，清空输入缓冲区的首字符，并显示提示符：
 
-## 快速开始
-
-### 最小使用示例
-
-#### 初始化 Shell
-
-```c
-#include "shell.h"
-
-void hrtos_main(void)
-{
-    // 初始化 Shell
-    shell_init();
-    
-    // 初始化 UART
-    bsp_uart_init();
-    
-    // 初始化 Shell 事件
-    os_event_init(SHELL_EVENT_RX);
-}
+```text
+HRTOS>
 ```
 
-#### 创建 Shell 任务
+当前 `hrtos_main()` 和 `shell_task()` 都调用了 `shell_init()`，因此启动过程中可能出现两次提示符输出。若希望启动界面只显示一次提示符，应统一初始化职责，避免重复初始化。
+
+### Shell 任务
+
+当前 Shell 任务的主要逻辑如下：
 
 ```c
 static void shell_task(void)
 {
     shell_init();
-    
-    while(1)
+
+    while (1)
     {
         shell_process();
         os_delay(10);
     }
 }
-
-void hrtos_main(void)
-{
-    shell_init();
-    bsp_uart_init();
-    os_event_init(SHELL_EVENT_RX);
-    
-    // 创建 Shell 任务
-    os_task_create(
-        shell_task,
-        1,          // 任务 ID
-        1,          // 优先级
-        6           // 堆栈大小
-    );
-}
 ```
 
-#### UART 配置
+Shell 任务循环调用 `shell_process()`，并在每轮处理后调用 `os_delay(10)`。
 
-UART 配置在 BSP 层完成，根据目标 MCU 修改 `bsp_uart_init()`：
+延时参数的实际时间单位及其调度行为，应以当前 HRTOS 时间接口的定义为准，不应脱离内核配置直接将其视为固定毫秒数。
+
+## UART 配置
+
+当前 BSP 使用 Timer1 模式 2 产生 UART 波特率时钟。
 
 ```c
 void bsp_uart_init(void)
 {
-    SCON = 0x50;        // 8位数据，可变波特率
+    SCON = 0x50;
+
     TMOD &= 0x0F;
-    TMOD |= 0x20;       // 定时器1模式2
-    TL1 = 0xFD;         // 波特率 9600
+    TMOD |= 0x20;
+
+    TL1 = 0xFD;
     TH1 = 0xFD;
+
     ET1 = 0;
     TR1 = 1;
+
     EA = 1;
     ES = 1;
 }
 ```
 
-#### 启动运行
+主要配置如下：
 
-编译烧录后，通过串口终端（如 SecureCRT、Putty）连接：
+| 配置项 | 当前设置 | 说明 |
+|---|---|---|
+| UART 工作方式 | `SCON = 0x50` | 串口模式 1，允许接收 |
+| Timer1 模式 | 模式 2 | 8 位自动重装载定时器 |
+| `TH1` | `0xFD` | 定时器重装载值 |
+| `TL1` | `0xFD` | 定时器初始计数值 |
+| `ET1` | 0 | 不启用 Timer1 中断 |
+| `TR1` | 1 | 启动 Timer1 |
+| `ES` | 1 | 使能串口中断 |
+| `EA` | 1 | 使能总中断 |
 
-- 波特率：9600
-- 数据位：8
-- 停止位：1
-- 校验位：无
+实际波特率取决于目标 MCU 的串口时钟机制、晶振频率以及相关配置。传统 8051 的常见配置在特定条件下可使用 9600 baud，但更换晶振或芯片型号后，应重新计算并验证。
 
-连接成功后，将看到提示符：
+推荐使用串口终端进行连接测试。数据位、停止位、校验方式和波特率均应与实际硬件配置一致。
 
-```
-HRTOS> 
-```
+## 输入接收与命令处理
 
----
+### 字符接收
 
-## Shell 配置说明
+UART 接收处理函数从 `SBUF` 读取字符，并清除接收标志 `RI`。
 
-### 宏配置
+当前输入逻辑区分三种情况：
 
-| 名称 | 类型 | 说明 |
-|------|------|------|
-| SHELL_MAX_LINE_LEN | 宏 | 命令行最大长度，默认 32 |
-| SHELL_MAX_ARGC | 宏 | 最大命令参数个数，默认 8 |
-| SHELL_EVENT_RX | 宏 | Shell 事件标志，默认 1 |
-| SHELL_CMD_COUNT | 宏 | 命令表命令数量，默认 5 |
+- **回车或换行：** 为输入行添加字符串结束符；若输入非空，则调用 `os_event_set_from_isr(SHELL_EVENT_RX)`。
+- **退格字符：** 支持 `'\b'` 和 `0x7F`，在输入位置大于零时将位置减一。
+- **普通字符：** 当缓冲区尚有空间时，保存字符并递增输入位置。
 
-### 全局变量
+当前代码未启用逐字符回显和退格删除的终端显示逻辑，因此输入过程中不一定会在终端上看到已输入字符。相关 `shell_putc()` 调用在所提供的接收代码中处于注释状态。
 
-| 名称 | 类型 | 说明 |
-|------|------|------|
-| shell_line | char[] | Shell 输入缓冲区 |
-| shell_pos | unsigned char | 当前输入位置 |
+### 命令行解析
 
-### 配置建议
+解析函数为：
 
-根据实际需求调整配置：
-
-- 增加命令行长度：修改 `SHELL_MAX_LINE_LEN`
-- 增加参数个数：修改 `SHELL_MAX_ARGC`
-- 修改事件标志：修改 `SHELL_EVENT_RX`
-
----
-
-## Shell API 参考
-
-### shell_init
-
-**功能说明**：初始化 Shell 模块
-
-**函数原型**：
-```c
-void shell_init(void);
-```
-
-**参数说明**：无
-
-**返回值**：无
-
-**使用示例**：
-```c
-void hrtos_main(void)
-{
-    shell_init();
-    bsp_uart_init();
-    os_event_init(SHELL_EVENT_RX);
-}
-```
-
----
-
-### shell_process
-
-**功能说明**：Shell 周期处理函数，在 Shell 任务中循环调用
-
-**函数原型**：
-```c
-void shell_process(void);
-```
-
-**参数说明**：无
-
-**返回值**：无
-
-**使用示例**：
-```c
-static void shell_task(void)
-{
-    shell_init();
-    
-    while(1)
-    {
-        shell_process();
-        os_delay(10);
-    }
-}
-```
-
----
-
-### shell_putc
-
-**功能说明**：输出一个字符到串口
-
-**函数原型**：
-```c
-void shell_putc(char ch);
-```
-
-**参数说明**：
-- `ch`：要输出的字符
-
-**返回值**：无
-
-**使用示例**：
-```c
-shell_putc('A');
-```
-
----
-
-### shell_puts
-
-**功能说明**：输出字符串到串口
-
-**函数原型**：
-```c
-void shell_puts(const char *str);
-```
-
-**参数说明**：
-- `str`：要输出的字符串
-
-**返回值**：无
-
-**使用示例**：
-```c
-shell_puts("Hello HRTOS\r\n");
-```
-
----
-
-### shell_printf
-
-**功能说明**：格式化输出，支持 %d、%u、%x、%s、%c 格式
-
-**函数原型**：
-```c
-void shell_printf(const char *fmt, ...);
-```
-
-**参数说明**：
-- `fmt`：格式化字符串
-- `...`：可变参数
-
-**返回值**：无
-
-**使用示例**：
-```c
-shell_printf("Task ID: %d, Priority: %d\r\n", task_id, priority);
-shell_printf("Value: 0x%x\r\n", value);
-```
-
----
-
-### shell_prompt
-
-**功能说明**：显示 Shell 命令提示符
-
-**函数原型**：
-```c
-void shell_prompt(void);
-```
-
-**参数说明**：无
-
-**返回值**：无
-
-**使用示例**：
-```c
-shell_prompt();  // 输出 "HRTOS> "
-```
-
----
-
-### shell_parse_line
-
-**功能说明**：解析命令行，将输入字符串分割为 argc/argv 格式
-
-**函数原型**：
 ```c
 void shell_parse_line(char *line);
 ```
 
-**参数说明**：
-- `line`：命令行字符串
+函数先输出收到的整行文本，然后调用内部的 `shell_strtok()` 按空格分割命令，生成 `argc` 和 `argv`，最后调用 `shell_cmd_execute()`。
 
-**返回值**：无
+例如输入：
 
-**使用示例**：
-```c
-char line[] = "task list";
-shell_parse_line(line);
+```text
+task list
 ```
 
----
+解析结果为：
 
-### shell_cmd_execute
+```c
+argc = 2;
+argv[0] = "task";
+argv[1] = "list";
+```
 
-**功能说明**：执行 Shell 命令
+其中：
 
-**函数原型**：
+- `argc` 表示参数个数，包含主命令。
+- `argv[0]` 是主命令名称。
+- `argv[1]` 及后续元素是子命令和参数。
+
+当前分割逻辑会将分隔空格替换为 `'\0'`，因此解析会直接修改原始输入缓冲区。连续空格会被跳过，但不支持带空格的引号参数。
+
+### 命令匹配
+
+命令分派函数为：
+
 ```c
 void shell_cmd_execute(int argc, char *argv[]);
 ```
 
-**参数说明**：
-- `argc`：参数个数
-- `argv`：参数列表
+函数遍历 `shell_cmd_table`，通过 `shell_strcmp()` 比较 `argv[0]` 与命令名称。匹配成功后，调用相应处理函数；如果没有找到匹配项，则输出：
 
-**返回值**：无
+```text
+Unknown command
+```
 
-**使用示例**：
+当前命令匹配区分大小写，命令表中使用的是小写名称。
+
+### 输入事件与处理流程
+
+当前 `shell_process()` 的主要逻辑如下：
+
 ```c
-char *argv[] = {"task", "list"};
-shell_cmd_execute(2, argv);
+void shell_process(void)
+{
+    os_event_wait(SHELL_EVENT_RX, 0);
+
+    shell_parse_line(shell_line);
+
+    shell_pos = 0;
+    shell_line[0] = '\0';
+
+    os_event_delete(SHELL_EVENT_RX);
+
+    shell_prompt();
+}
 ```
 
----
+其处理顺序为：
 
-## 内置命令说明
+- 等待或检查 Shell 接收事件，具体语义由 HRTOS 事件 API 决定。
+- 解析输入缓冲区。
+- 重置输入位置和缓冲区首字符。
+- 删除对应事件。
+- 显示下一次输入提示符。
 
-### help 命令
+当前实现将输入缓冲区、输入位置与事件标识配合使用。若需要支持高频连续输入、多行缓存或更复杂的串口交互，应进一步检查事件清除时机及中断与任务之间的数据竞争。
 
-**功能**：显示所有可用命令列表
+## 内置命令
 
-**使用方法**：
-```
+### `help`：查看命令列表
+
+用法：
+
+```text
 help
 ```
 
-**参数**：无
+当前输出：
 
-**示例**：
-```
-HRTOS> help
+```text
 Available commands:
   help
   version
@@ -517,181 +331,319 @@ Available commands:
   msg
 ```
 
----
+该命令只显示命令名称，不输出每个命令的详细参数帮助。
 
-### version 命令
+### `version`：查看版本信息
 
-**功能**：显示系统版本信息
+用法：
 
-**使用方法**：
-```
+```text
 version
 ```
 
-**参数**：无
+当前源码输出：
 
-**示例**：
-```
-HRTOS> version
-HRTOS Version 1.0.0
-```
-
----
-
-### task 命令
-
-**功能**：任务管理，包括查看任务列表、挂起/恢复任务、修改优先级
-
-**使用方法**：
-```
-task list              查看任务状态
-task suspend <id>      挂起任务
-task resume <id>       恢复任务
-task priority <id> <pr> 修改任务优先级
+```text
+HRTOS Version 4.0.0LTS
+CPU: 8051
+Task: 16
+MsgQ: 3
+Resource: 6
+Website: https://hrtos.com
+Email: admin@hrtos.com
 ```
 
-**参数**：
-- `id`：任务 ID（0-15）
-- `pr`：优先级（0-8）
+其中任务数、消息队列数和资源数是当前版本输出的配置信息。它们是否与实际编译配置一致，应结合对应内核宏定义确认。
 
-**示例**：
+### `task`：任务管理
+
+当前支持以下子命令：
+
+```text
+task list
+task suspend <id>
+task resume <id>
+task priority <id> <pr>
 ```
-HRTOS> task list
+
+#### 查看任务列表
+
+```text
+task list
+```
+
+当前输出列：
+
+```text
 ID STATE PRIO
-0  1     1
-1  1     2
-2  1     3
+```
 
-HRTOS> task suspend 1
+- `ID`：任务索引。
+- `STATE`：由 `os_task_get_state()` 返回的状态值。
+- `PRIO`：由 `os_task_get_priority()` 返回的优先级值。
+
+该命令遍历任务索引 `0` 至 `15`，仅在 `os_task_is_valid(i) == 1` 时输出相应任务。
+
+状态和优先级的数字含义应参照 HRTOS 内核的状态定义及优先级规则。
+
+#### 挂起任务
+
+```text
+task suspend <id>
+```
+
+例如：
+
+```text
+task suspend 2
+```
+
+命令先检查是否提供任务 ID，再将输入转换为数值，并检查 ID 是否小于 16。随后调用 `os_task_suspend(id)`。
+
+成功时输出：
+
+```text
 suspend ok
-
-HRTOS> task resume 1
-resume ok
-
-HRTOS> task priority 1 5
-priority ok
 ```
 
----
+失败时输出：
 
-### wait 命令
-
-**功能**：查看阻塞任务列表
-
-**使用方法**：
+```text
+suspend failed
 ```
+
+需要注意：当前 `suspend` 和 `resume` 使用 `shell_atoi()` 转换参数。该转换函数不是严格的数字校验器；遇到非数字开头的参数时可能返回 0。因此，不应将当前实现描述为已经完整验证了所有任务 ID 输入格式。
+
+#### 恢复任务
+
+```text
+task resume <id>
+```
+
+例如：
+
+```text
+task resume 2
+```
+
+该命令调用 `os_task_resume(id)`。成功时输出 `resume ok`，失败时输出 `resume failed`。
+
+#### 修改优先级
+
+```text
+task priority <id> <pr>
+```
+
+例如：
+
+```text
+task priority 2 5
+```
+
+该子命令要求参数数量严格为 4，并使用严格数字解析函数检查任务 ID 和优先级：
+
+- 任务 ID 必须为 `0–15`。
+- 优先级必须为 `0–8`。
+
+输入不合法时输出相应的 `Invalid task id` 或 `Invalid priority`；内核接口返回 `-1` 时输出 `priority failed`，其他返回值则输出 `priority ok`。
+
+这里的范围是当前 Shell 命令实现中的参数检查范围，具体优先级的调度含义应以 HRTOS 内核定义为准。
+
+### `wait`：查看等待任务
+
+用法：
+
+```text
 wait list
 ```
 
-**参数**：无
+输出表头：
 
-**示例**：
-```
-HRTOS> wait list
+```text
 ID  TYPE        OBJ  TICK  FLAG
-1   SEM         0    100   0
-2   MSG_RECV    1    50    1
 ```
 
-**输出说明**：
-- `ID`：任务 ID
-- `TYPE`：等待类型（DELAY、SEM、MUTEX、MSG_SEND、MSG_RECV、EVENT、MAILBOX）
-- `OBJ`：等待对象 ID
-- `TICK`：等待超时时间
-- `FLAG`：等待标志
+该命令遍历 `OS_PROCESS_MAX` 范围内的任务，只显示 `OS_TASK[i].state == WAIT` 的条目。
 
----
+| 字段 | 含义 |
+|---|---|
+| `ID` | 当前遍历的任务索引 |
+| `TYPE` | 等待类型 |
+| `OBJ` | 等待对象标识 |
+| `TICK` | 等待计时值 |
+| `FLAG` | 等待标志 |
 
-### msg 命令
+当前实现识别以下等待类型：
 
-**功能**：查看消息队列信息
+- `DELAY`
+- `SEM`
+- `MUTEX`
+- `MSG_SEND`
+- `MSG_RECV`
+- `EVENT`
+- `MAILBOX`
 
-**使用方法**：
-```
+未匹配到的类型输出 `UNKNOWN`。
+
+该命令读取内核任务表中的字段，并不独立维护等待状态。显示结果的准确性取决于内核对任务状态、等待类型和相关字段的实际维护方式。
+
+### `msg`：查看消息队列
+
+用法：
+
+```text
 msg list
 ```
 
-**参数**：无
+输出表头：
 
-**示例**：
-```
-HRTOS> msg list
+```text
 ID  SIZE  COUNT  HEAD  TAIL
-0   32    5      0     3
-1   64    10     2     8
 ```
 
-**输出说明**：
-- `ID`：消息队列 ID
-- `SIZE`：队列大小
-- `COUNT`：当前消息数量
-- `HEAD`：队列头位置
-- `TAIL`：队列尾位置
+当前实现遍历 `0` 至 `OS_MSGQ_MAX - 1`，读取消息队列的 `_size`、`count`、`head` 和 `tail` 字段。
 
----
+| 字段 | 含义 |
+|---|---|
+| `ID` | 消息队列索引 |
+| `SIZE` | 队列配置的大小字段 |
+| `COUNT` | 当前队列计数字段 |
+| `HEAD` | 队列头位置 |
+| `TAIL` | 队列尾位置 |
+
+这些字段的具体单位和边界含义，应以消息队列实现为准。当前命令是状态查询接口，不负责创建、删除或收发消息。
+
+## Shell 输出接口
+
+### `shell_puts()`
+
+函数原型：
+
+```c
+void shell_puts(const char *str);
+```
+
+功能：将字符串交给 BSP 串口发送函数输出。
+
+当前实现：
+
+```c
+void shell_puts(const char *str)
+{
+    bsp_uart_send_str_ram(str);
+}
+```
+
+字符串必须以 `'\0'` 结束。该接口面向当前 RAM 字符串发送实现；如果需要输出程序存储区中的常量字符串，应确认 Keil C51 存储区模型与 BSP 接口是否兼容。
+
+### `shell_putc()`
+
+函数原型：
+
+```c
+void shell_putc(char ch);
+```
+
+该函数在 `shell.h` 中声明。所提供的 `shell_port.c` 代码只展示了 `shell_puts()` 的实现，未展示 `shell_putc()` 的函数体。
+
+如果工程中没有其他文件提供该函数定义，则应补充实现或移除未使用的声明，以避免链接问题。
+
+### `shell_printf()`
+
+函数原型：
+
+```c
+void shell_printf(const char *fmt, ...);
+```
+
+当前轻量级格式化函数支持以下格式：
+
+| 格式 | 含义 |
+|---|---|
+| `%d` | 有符号十进制整数 |
+| `%u` | 无符号十进制整数 |
+| `%x` | 十六进制整数，字母使用大写形式 |
+| `%s` | 字符串 |
+| `%c` | 字符 |
+| `%%` | 输出百分号 |
+
+示例：
+
+```c
+shell_printf("Task ID: %d\r\n", task_id);
+shell_printf("Count: %u\r\n", count);
+shell_printf("Value: 0x%x\r\n", value);
+shell_printf("Name: %s\r\n", name);
+```
+
+当前实现使用固定的 32 字节静态缓冲区，并通过 `tiny_vsprintf()` 格式化数据。它不支持完整标准库 `printf()` 的所有格式控制能力。
+
+**重要限制：** 当前 `tiny_vsprintf()` 对 `%s` 的复制长度有限制，但其他格式分支没有统一的缓冲区边界检查。因此，不能保证任意格式串和任意参数组合都不会写越界。正式使用前，建议为所有输出路径增加统一的剩余空间检查，并验证格式化结果长度。
+
+此外，静态输出缓冲区不适合未经同步的并发调用。若多个任务可能同时调用 `shell_printf()`，应结合 UART 发送机制评估输出串扰与重入问题。
 
 ## 自定义命令扩展
 
-### 命令注册方式
+### 命令表
 
-在 `Src/Cmd/shell_cmd.c` 中的命令表添加新命令：
+当前命令表结构定义如下：
+
+```c
+typedef struct
+{
+    const char *name;
+    void (*func)(int argc, char *argv[]);
+    const char *help;
+} shell_cmd_t;
+```
+
+当前命令表：
 
 ```c
 const shell_cmd_t shell_cmd_table[] =
 {
-    { "help",    shell_cmd_help,    "show command list"      },
-    { "version", shell_cmd_version, "show system version"    },
-    { "task",    shell_cmd_task,    "task management"        },
-    { "wait",    shell_cmd_wait,    "show waiting tasks"     },
-    { "msg",     shell_cmd_msg,     "message management"     },
-    { "mycmd",   shell_cmd_mycmd,   "my custom command"      }  // 新增命令
+    { "help",    shell_cmd_help,    "show command list" },
+    { "version", shell_cmd_version, "show system version" },
+    { "task",    shell_cmd_task,    "task management" },
+    { "wait",    shell_cmd_wait,    "show waiting tasks" },
+    { "msg",     shell_cmd_msg,     "message management" }
 };
 ```
 
-### 命令名称定义
+新增命令时，需要同时完成：
 
-命令名称需满足：
-- 小写字母
-- 不含特殊字符
-- 简洁明了
+- 编写命令处理函数。
+- 声明命令处理函数。
+- 在命令表中添加对应表项。
+- 更新 `SHELL_CMD_COUNT`，确保其与命令表实际条目数一致。
+- 如果需要通过 `help` 查看新命令，更新帮助命令的显示逻辑。
 
-### 参数处理方式
+### 命令函数
 
-命令函数原型：
+命令函数统一使用以下接口形式：
 
 ```c
 void shell_cmd_mycmd(int argc, char *argv[]);
 ```
 
-参数说明：
-- `argc`：参数个数（包括命令本身）
-- `argv`：参数数组，argv[0] 为命令名
-
-### 执行函数编写
-
-完整示例：
+示例：
 
 ```c
 void shell_cmd_mycmd(int argc, char *argv[])
 {
-    // 检查参数个数
     if (argc < 2)
     {
-        shell_puts("Usage:\r\n");
-        shell_puts("  mycmd <param>\r\n");
+        shell_puts("Usage: mycmd <on|off>\r\n");
         return;
     }
-    
-    // 处理参数
+
     if (shell_strcmp(argv[1], "on") == 0)
     {
         shell_puts("Turn ON\r\n");
-        // 执行开启操作
     }
     else if (shell_strcmp(argv[1], "off") == 0)
     {
         shell_puts("Turn OFF\r\n");
-        // 执行关闭操作
     }
     else
     {
@@ -700,421 +652,114 @@ void shell_cmd_mycmd(int argc, char *argv[])
 }
 ```
 
-### 完整示例
+新增命令时，应检查参数数量、参数格式及取值范围。对会影响内核状态或硬件状态的操作，还应检查调用时机、权限和失败处理。
 
-添加一个 LED 控制命令：
+## 移植说明
 
-```c
-// 在 shell_cmd.c 中添加命令表项
-{ "led",     shell_cmd_led,     "LED control"     }
+移植到其他 8051 系列 MCU 时，主要检查以下部分。
 
-// 在单独文件中实现命令函数
-void shell_cmd_led(int argc, char *argv[])
-{
-    u8 led_id;
-    
-    if (argc < 3)
-    {
-        shell_puts("Usage:\r\n");
-        shell_puts("  led <id> <on|off>\r\n");
-        return;
-    }
-    
-    led_id = shell_atoi(argv[1]);
-    
-    if (shell_strcmp(argv[2], "on") == 0)
-    {
-        // 点亮 LED
-        shell_printf("LED %d ON\r\n", led_id);
-    }
-    else if (shell_strcmp(argv[2], "off") == 0)
-    {
-        // 熄灭 LED
-        shell_printf("LED %d OFF\r\n", led_id);
-    }
-    else
-    {
-        shell_puts("Invalid command\r\n");
-    }
-}
-```
+### UART 硬件适配
 
-使用示例：
-```
-HRTOS> led 1 on
-LED 1 ON
+- UART 工作模式及寄存器定义。
+- Timer1 或其他波特率时钟源的配置。
+- 实际波特率与晶振频率。
+- 接收中断入口和中断使能。
+- 串口发送函数及字符串所在存储区。
 
-HRTOS> led 1 off
-LED 1 OFF
-```
+### HRTOS 接口适配
 
----
+- 事件初始化与事件设置接口。
+- 中断上下文中的事件操作是否合法。
+- 任务创建接口及堆栈参数定义。
+- 任务挂起、恢复和优先级设置接口。
+- 任务状态、等待状态和消息队列数据结构。
 
-## Shell 移植说明
+### 内存与并发
 
-### 移植文件
-
-移植到不同 MCU 需要修改以下文件：
-
-- **shell_port.c**：字符输入输出接口
-- **bsp_uart_init()**：UART 初始化
-- **uart_isr()**：UART 中断处理
-
-### 字符输入接口
-
-在 UART 中断中调用 Shell 输入处理：
-
-```c
-void uart_isr(void)
-{
-    char ch;
-    
-    if (RI)
-    {
-        ch = SBUF;
-        RI = 0;
-        
-        // 回车处理
-        if ((ch == '\r') || (ch == '\n'))
-        {
-            shell_line[shell_pos] = '\0';
-            if (shell_pos > 0)
-            {
-                os_event_set_from_isr(SHELL_EVENT_RX);
-            }
-        }
-        // 退格处理
-        else if ((ch == '\b') || (ch == 0x7F))
-        {
-            if (shell_pos > 0)
-            {
-                shell_pos--;
-            }
-        }
-        // 普通字符
-        else if (shell_pos < (SHELL_MAX_LINE_LEN - 1))
-        {
-            shell_line[shell_pos++] = ch;
-        }
-    }
-}
-```
-
-### 字符输出接口
-
-实现 `shell_putc()` 和 `shell_puts()`：
-
-```c
-void shell_putc(char ch)
-{
-    bsp_uart_send_byte((unsigned char)ch);
-}
-
-void shell_puts(const char *str)
-{
-    bsp_uart_send_str_ram(str);
-}
-```
-
-### UART 适配
-
-根据目标 MCU 修改 `bsp_uart_init()`：
-
-```c
-void bsp_uart_init(void)
-{
-    // 配置 UART 参数
-    // 设置波特率
-    // 使能中断
-}
-```
-
-### 移植步骤
-
-1. 实现底层 UART 驱动
-2. 实现 `bsp_uart_init()`
-3. 实现 `bsp_uart_send_byte()`
-4. 实现 `bsp_uart_send_str_ram()`
-5. 修改 UART 中断处理函数
-6. 调整波特率和中断优先级
-
----
-
-## HRTOS 调试应用示例
-
-### 查看任务状态
-
-使用 `task list` 命令查看所有任务：
-
-```
-HRTOS> task list
-ID STATE PRIO
-0  1     1
-1  1     2
-2  1     3
-```
-
-**应用场景**：
-- 确认任务是否正确创建
-- 检查任务优先级配置
-- 监控任务运行状态
-
-### 查看消息队列
-
-使用 `msg list` 命令查看消息队列状态：
-
-```
-HRTOS> msg list
-ID  SIZE  COUNT  HEAD  TAIL
-0   32    5      0     3
-```
-
-**应用场景**：
-- 监控消息队列使用情况
-- 检测消息积压
-- 调试消息传递问题
-
-### 查看等待状态
-
-使用 `wait list` 命令查看阻塞任务：
-
-```
-HRTOS> wait list
-ID  TYPE        OBJ  TICK  FLAG
-1   SEM         0    100   0
-2   MSG_RECV    1    50    1
-```
-
-**应用场景**：
-- 诊断死锁问题
-- 查看任务等待原因
-- 监控系统资源竞争
-
-### 任务控制
-
-动态控制任务运行：
-
-```
-HRTOS> task suspend 2
-suspend ok
-
-HRTOS> task resume 2
-resume ok
-
-HRTOS> task priority 2 5
-priority ok
-```
-
-**应用场景**：
-- 临时挂起调试任务
-- 动态调整任务优先级
-- 测试任务调度策略
-
-### 查看版本信息
-
-```
-HRTOS> version
-HRTOS Version 1.0.0
-```
-
-**应用场景**：
-- 确认固件版本
-- 现场版本确认
-- 问题追溯
-
----
-
-## Demo 说明
-
-### 硬件环境
-
-Demo 基于 51 单片机：
-- MCU：8051 系列
-- 外设：UART 串口
-- 波特率：9600
-
-### 软件结构
-
-Demo 包含以下任务：
-
-1. **Shell 任务**：处理命令行输入
-2. **UART 中断任务**：接收串口数据
-3. **Demo 任务 1**：LED 闪烁测试
-4. **Demo 任务 2**：LED 闪烁测试
-
-### 任务结构
-
-```c
-void hrtos_main(void)
-{
-    shell_init();
-    bsp_uart_init();
-    os_event_init(SHELL_EVENT_RX);
-    
-    // Shell 任务
-    os_task_create(shell_task, 1, 1, 6);
-    
-    // UART 中断任务
-    os_task_create(uart_isr, 0, 9, 0);
-    
-    // Demo 任务
-    os_task_create(demo_task1, 2, 1, 2);
-    os_task_create(demo_task2, 3, 2, 2);
-}
-```
-
-### 运行效果
-
-系统启动后，通过串口终端连接，显示提示符：
-
-```
-HRTOS> 
-```
-
-可以输入命令进行交互：
-
-```
-HRTOS> help
-Available commands:
-  help
-  version
-  task
-  wait
-  msg
-
-HRTOS> task list
-ID STATE PRIO
-0  1     1
-1  1     2
-2  1     1
-3  1     2
-
-HRTOS> version
-HRTOS Version 1.0.0
-```
-
-### 操作示例
-
-1. 连接串口终端（9600, 8N1）
-2. 看到 `HRTOS>` 提示符
-3. 输入 `help` 查看命令列表
-4. 输入 `task list` 查看任务状态
-5. 输入 `version` 查看版本信息
-
----
+- 输入缓冲区和参数数组的 RAM 占用。
+- 格式化输出缓冲区的容量与越界保护。
+- UART 发送是否会阻塞调用任务。
+- 多任务输出时是否需要串口互斥。
+- UART 中断与 Shell 任务共享数据时的同步策略。
 
 ## 常见问题
 
-### 无法输入字符
+### 无法接收串口字符
 
-**可能原因**：
-- UART 未正确初始化
-- 波特率不匹配
-- 中断未使能
+检查：
 
-**解决方法**：
-- 检查 `bsp_uart_init()` 配置
-- 确认终端波特率设置为 9600
-- 检查 EA、ES 中断使能位
+- UART 是否正确初始化。
+- `ES` 和 `EA` 是否按预期使能。
+- 接收中断是否进入正确的 HRTOS 分派路径。
+- 实际波特率是否与终端一致。
+- `RI` 是否被正确处理。
 
-### 命令无响应
+### 输入字符没有回显
 
-**可能原因**：
-- Shell 任务未创建
-- 事件未初始化
-- 命令解析错误
+当前 UART 接收代码中的字符回显语句被注释，因此没有逐字符回显属于当前实现的行为。
 
-**解决方法**：
-- 确认 `os_task_create()` 创建了 Shell 任务
-- 检查 `os_event_init(SHELL_EVENT_RX)` 调用
-- 查看命令拼写是否正确
+如果需要输入时显示字符，应实现回显，并同时处理退格时的终端显示。应避免在中断上下文中执行过长的阻塞式串口发送。
 
-### UART 乱码
+### 输入命令后没有结果
 
-**可能原因**：
-- 波特率不匹配
-- 定时器配置错误
-- 晶振频率不匹配
+检查：
 
-**解决方法**：
-- 确认终端和 MCU 波特率一致
-- 检查定时器重装值（TL1、TH1）
-- 根据实际晶振频率调整定时器值
+- `SHELL_EVENT_RX` 是否正确初始化。
+- 回车或换行是否触发事件设置。
+- Shell 任务是否已成功创建并运行。
+- `os_event_wait()` 的等待语义是否符合预期。
+- 命令表中的数量与实际条目是否一致。
 
 ### 命令无法识别
 
-**可能原因**：
-- 命令拼写错误
-- 命令未注册
-- 命令表未更新
+当前命令匹配区分大小写。例如，命令表注册的是 `task`，应使用：
 
-**解决方法**：
-- 使用 `help` 查看可用命令
-- 检查命令表是否包含该命令
-- 确认命令名称拼写正确（小写）
+```text
+task list
+```
 
-### 参数错误
+同时检查命令是否已加入 `shell_cmd_table`，以及 `SHELL_CMD_COUNT` 是否同步更新。
 
-**可能原因**：
-- 参数个数不足
-- 参数类型错误
-- 参数超出范围
+### 任务 ID 输入异常
 
-**解决方法**：
-- 使用命令的 help 功能查看用法
-- 检查参数个数是否正确
-- 确认参数值在有效范围内
+`task suspend` 和 `task resume` 当前使用宽松的 `shell_atoi()` 转换参数。非数字输入可能被转换为 0。
 
-### Shell 提示符不显示
+如果需要严格的输入验证，建议这两个子命令也使用严格的无符号整数解析函数，并在转换成功后再检查任务 ID 范围。
 
-**可能原因**：
-- `shell_init()` 未调用
-- `shell_prompt()` 未执行
-- 输出函数未实现
+### 输出乱码或格式异常
 
-**解决方法**：
-- 确认在 `hrtos_main()` 中调用了 `shell_init()`
-- 检查 `shell_prompt()` 函数实现
-- 验证 `shell_puts()` 输出功能
+检查：
 
----
+- UART 波特率与晶振配置。
+- 输出字符串的结束符。
+- 格式说明符与实际参数类型是否匹配。
+- `shell_printf()` 格式化缓冲区是否足够。
+- 多任务并发输出是否造成数据覆盖。
 
-## 附录
+## 当前实现边界
 
-### A. 命令速查表
+本节用于区分现有功能与尚需额外实现或验证的能力。
 
-| 命令 | 功能 | 示例 |
-|------|------|------|
-| help | 显示命令列表 | `help` |
-| version | 显示版本信息 | `version` |
-| task list | 查看任务状态 | `task list` |
-| task suspend | 挂起任务 | `task suspend 1` |
-| task resume | 恢复任务 | `task resume 1` |
-| task priority | 修改优先级 | `task priority 1 5` |
-| wait list | 查看阻塞任务 | `wait list` |
-| msg list | 查看消息队列 | `msg list` |
+- **输入长度有限。** 默认缓冲区为 32 字节，最多保存 31 个命令字符。
+- **参数数量有限。** 默认最多保存 8 个参数。
+- **解析方式简单。** 当前按空格分割，不支持引号参数、转义或复杂命令语法。
+- **没有逐字符回显。** 接收代码中的回显逻辑当前被注释。
+- **输出格式有限。** `shell_printf()` 是轻量级实现，不是完整标准 `printf()`；当前实现还需要补足统一的边界检查。
+- **任务命令依赖内核接口。** 实际状态、挂起、恢复和优先级修改结果由 HRTOS 内核接口决定。
+- **共享输入状态需要关注同步。** 中断与任务共同访问输入缓冲区和输入位置，连续输入时应验证同步策略。
+- **串口发送为轮询方式。** 当前 `bsp_uart_send_str_ram()` 逐字符等待 `TI`，可能阻塞调用者，不宜直接视为非阻塞输出接口。
 
-### B. 配置参数速查表
+## 命令速查表
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| SHELL_MAX_LINE_LEN | 32 | 命令行最大长度 |
-| SHELL_MAX_ARGC | 8 | 最大参数个数 |
-| SHELL_EVENT_RX | 1 | Shell 事件标志 |
-| SHELL_CMD_COUNT | 5 | 命令数量 |
+| 命令 | 功能 |
+|---|---|
+| `help` | 显示主命令列表 |
+| `version` | 显示系统版本与配置字段 |
+| `task list` | 查看有效任务状态 |
+| `task suspend <id>` | 挂起指定任务 |
+| `task resume <id>` | 恢复指定任务 |
+| `task priority <id> <pr>` | 修改任务优先级 |
+| `wait list` | 查看等待状态的任务 |
+| `msg list` | 查看消息队列信息 |
 
-### C. 错误码说明
-
-Shell 模块使用字符串返回错误信息：
-
-- `Unknown command`：命令不存在
-- `Invalid task id`：任务 ID 无效
-- `Invalid priority`：优先级无效
-- `suspend failed`：挂起失败
-- `resume failed`：恢复失败
-- `priority failed`：优先级设置失败
-
----
-
-**更新日期**：2026-07-23  
-**适用版本**：HRTOS 3.32+
+**说明：** 命令的实际执行结果取决于 HRTOS 内核接口、任务状态及当前编译配置。使用前请确认目标工程与本手册适用版本一致。

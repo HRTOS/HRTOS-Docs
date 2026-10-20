@@ -1,626 +1,520 @@
 # HRTOS 调用流程
 
-## 模块介绍
+## 文档概述
 
-调用流程描述了 HRTOS 中的执行路径，展示了函数在各种操作期间如何相互调用。理解调用流程对于调试、性能分析和系统理解至关重要。
+HRTOS 内核通过任务注册、任务状态管理、等待与唤醒、调度请求以及任务资源回收等机制，组织系统的运行过程。
 
-## 主要职责
+本文围绕内核关键调用链，介绍系统初始化、任务创建、任务清理、任务等待、任务唤醒和调度请求的执行流程，并说明普通任务与高速任务在等待处理和资源管理方面的区别。
 
-调用流程文档涵盖：
+本文涉及的核心机制包括：
 
-- 任务创建和删除流程
-- 调度和上下文切换流程
-- IPC 操作流程
-- 中断处理流程
-- 定时器和延时流程
+- **系统初始化与配置管理**：初始化任务状态、等待信息及系统资源，并在用户初始化完成后锁定系统配置。
+- **任务注册与运行栈管理**：为标准任务和高速任务分配运行栈，并初始化入口地址及相关上下文信息。
+- **任务等待与唤醒**：通过任务控制信息记录等待条件、等待对象、超时计数及唤醒结果。
+- **调度请求**：通过调度请求标志和 Timer0 中断触发任务重新调度。
+- **任务清理与资源回收**：释放任务占用的运行栈空间，清除等待关系和互斥资源所有权，并重置任务状态。
+- **Idle Hook**：在空闲任务循环中提供用户扩展入口。
 
-## 主要文件
+## 核心文件与职责
 
-### 关键流程文件
+| 文件 | 主要职责 |
+|---|---|
+| `idle_task.c` | 初始化运行环境、调用用户初始化入口、锁定配置、执行空闲循环及任务清理 |
+| `task_create.c` | 注册标准任务、高速任务及中断处理函数，分配运行栈空间 |
+| `task_cleanup.c` | 回收任务运行栈空间、清除资源等待关系、释放互斥资源所有权 |
+| `wait.c` | 设置任务等待信息、建立资源等待关系、阻塞任务并触发调度 |
+| `wake_task.c` | 清除等待信息、设置唤醒结果、恢复任务就绪状态并触发调度 |
+| `schedule_request.c` | 设置调度请求标志并触发 Timer0 中断 |
 
-- `Src/kernel/task_create.c`：任务创建流程
-- `Src/kernel/task_cleanup.c`：任务清理流程
-- `Src/wait/os_wait.c`：等待流程
-- `Src/wait/wake_task.c`：唤醒流程
-- `Src/interrupt/schedule_request.c`：调度触发流程
-- `Src/kernel/scheduler.c`：调度器选择流程
+## 系统初始化与运行入口
+
+### 初始化流程
+
+HRTOS 通过 `os_idle_task()` 初始化内核运行环境。初始化阶段首先关闭总中断，随后重置空闲钩子、资源溢出钩子、调度请求标志及配置锁，并初始化普通任务的等待状态和系统资源状态。
+
+初始化完成后，系统调用 `hrtos_main()` 执行用户侧的系统配置和应用初始化。该阶段结束后，内核设置配置锁，禁止继续注册配置项，随后开启总中断并进入永久空闲循环。
+
+```mermaid
+flowchart TD
+    A["进入 os_idle_task()"] --> B["关闭总中断 EA=0"]
+    B --> C["初始化 Idle Hook 与资源溢出 Hook"]
+    C --> D["清除调度请求标志"]
+    D --> E["开放系统配置"]
+    E --> F["初始化普通任务等待状态"]
+    F --> G["初始化等待辅助变量"]
+    G --> H["初始化系统资源状态"]
+    H --> I["调用 hrtos_main()"]
+    I --> J["锁定系统配置"]
+    J --> K["开启总中断 EA=1"]
+    K --> L["进入永久 Idle 循环"]
+    L --> M["关闭总中断"]
+    M --> N["扫描普通任务并清理 DEAD 任务"]
+    N --> O["检查高速任务 A 删除请求"]
+    O --> P["检查高速任务 B 删除请求"]
+    P --> Q["开启总中断"]
+    Q --> R{"是否注册 Idle Hook"}
+    R -- 是 --> S["执行 Idle Hook"]
+    R -- 否 --> L
+    S --> L
+```
+
+### 初始化阶段的状态设置
+
+`os_idle_task()` 对以下状态进行初始化：
+
+1. 将 `g_idle_hook` 和 `g_slab_overflow_hook` 置空。
+2. 将 `OS_SCHED_REASON` 清零，清除已有调度请求标志。
+3. 将 `OS_CFG_LOCK` 置为 `0`，开放系统配置。
+4. 将普通任务的 `wait_type` 初始化为 `WAIT_NONE`，`state` 初始化为 `READY`，`wait_tick` 清零，`wait_obj` 设置为 `OS_INVALID_ID`。
+5. 清零 `OS_WAIT_DI2` 中两个高速任务的延时计数。
+6. 将各系统资源的 `value`、`wait_cnt`、`wait_mask` 和 `pending_signal` 清零，并将 `owner` 设置为 `OS_INVALID_ID`。
+
+这里的普通任务初始化循环覆盖任务编号 `0` 至 `OS_PROCESS_MAX - 1`。两个高速任务的运行状态和运行栈信息由其独立的注册及管理路径处理。
+
+### 配置阶段与运行阶段
+
+HRTOS 通过 `OS_CFG_LOCK` 区分系统配置阶段和正常运行阶段。
+
+| 阶段 | `OS_CFG_LOCK` | 运行行为 |
+|---|---:|---|
+| 用户初始化阶段 | `0` | 允许执行任务注册等配置操作 |
+| 正常运行阶段 | `1` | 禁止通过 `os_task_create()` 继续注册任务或中断处理函数 |
+
+`hrtos_main()` 是系统配置与应用初始化的入口。该函数返回后，内核锁定配置、开启总中断，并开始执行 Idle 循环。
+
+### Idle 循环与 Idle Hook
+
+Idle 循环主要承担两项职责：
+
+- 检查并处理任务删除请求。
+- 调用用户注册的 `g_idle_hook`。
+
+每轮循环首先关闭总中断，执行任务清理检查，然后重新开启总中断。只有在 `g_idle_hook` 非空时，才调用该钩子函数。
+
+Idle Hook 在开启总中断之后执行，因此它运行期间系统中断处于开放状态。用户实现该钩子时，应合理控制执行时间，避免长时间占用空闲任务的执行机会。
 
 ## 任务创建流程
 
-### 完整流程图
+### 创建入口
+
+`os_task_create(addr, id, pr, sd)` 用于注册标准任务、高速任务，以及设置中断处理函数和中断嵌套处理函数的入口地址。
+
+参数含义如下：
+
+| 参数 | 含义 |
+|---|---|
+| `addr` | 任务或处理函数入口地址 |
+| `id` | 任务编号 |
+| `pr` | 优先级及注册类型选择参数 |
+| `sd` | 运行栈空间参数 |
+
+函数通过 `pr` 判断注册类型。标准任务和高速任务需要分配运行栈空间；中断处理函数和中断嵌套处理函数则分别保存入口地址。
+
+### 注册类型选择
+
+函数首先检查配置锁和优先级参数，再根据 `pr` 选择对应的注册路径。
 
 ```mermaid
-sequenceDiagram
-    participant App as 应用程序
-    participant TC as task_create
-    participant BM as 位图管理器
-    participant SP as 栈指针
-    participant TCB as TCB 设置
-    participant Sched as 调度器
-
-    App->>TC: os_task_create(addr, id, pr, sd)
-    TC->>TC: 验证参数
-    TC->>TC: 检查优先级范围
-    TC->>TC: 检查重复
-    TC->>BM: 搜索位图中的空闲块
-    BM->>BM: 查找连续空闲块
-    BM->>TC: 返回块起始
-    TC->>TC: 计算初始 SP
-    TC->>TC: 检查栈溢出
-    TC->>SP: 将任务地址压入栈
-    TC->>TCB: 设置 OS_PROCESS_OK
-    TC->>TCB: 设置 OS_JINCHENG_SP
-    TC->>TCB: 设置 OS_JINCHENG_JILU_SP
-    TC->>Sched: 设置就绪标志
-    TC-->>App: 返回成功
+flowchart TD
+    A["调用 os_task_create()"] --> B{"OS_CFG_LOCK 是否为 1"}
+    B -- 是 --> E1["返回 -1"]
+    B -- 否 --> C{"pr 是否超过最大调度等级"}
+    C -- 是 --> E2["返回 -2"]
+    C -- 否 --> D{"pr 是否为中断处理等级"}
+    D -- 是 --> I["保存中断处理入口地址"]
+    D -- 否 --> J{"pr 是否为中断嵌套等级"}
+    J -- 是 --> K["保存中断嵌套入口地址"]
+    J -- 否 --> L["检查任务编号与入口地址"]
+    L --> M{"是否为标准任务"}
+    M -- 是 --> N["检查标准任务栈参数与重复注册"]
+    M -- 否 --> O["检查高速任务栈参数"]
+    N --> P["申请连续运行栈空间"]
+    O --> P
+    P --> Q{"空间申请成功"}
+    Q -- 否 --> E3["返回 -8"]
+    Q -- 是 --> R["计算初始 SP"]
+    R --> S{"注册类型"}
+    S -- 标准任务 --> T["初始化标准任务栈与注册信息"]
+    S -- 高速任务 --> U["初始化高速任务栈与启动标记"]
+    T --> V["返回 1"]
+    U --> V
+    I --> V
+    K --> V
 ```
 
-### 详细步骤
+中断处理函数和中断嵌套处理函数的分支在任务编号及入口地址检查之前执行。标准任务和高速任务则继续进行任务编号、入口地址及栈参数检查。
 
-1. **参数验证**
-   - 检查优先级范围（0-10）
-   - 检查任务 ID 有效性
-   - 检查地址不为 NULL
-   - 检查重复注册
+### 运行栈空间申请
 
-2. **栈分配**
-   - 搜索位图中的空闲块
-   - 查找匹配大小的连续块
-   - 在位图中标记块为已使用
-   - 计算初始栈指针
+标准任务与高速任务共用基于 `OS_MEMORY` 位图的运行栈空间申请机制。
 
-3. **栈初始化**
-   - 保存当前 SP
-   - 将 SP 设置为任务栈
-   - 压入任务地址（低字节）
-   - 压入任务地址（高字节）
-   - 恢复 SP
+申请过程如下：
 
-4. **TCB 设置**
-   - 在 `OS_PROCESS_OK` 中设置优先级
-   - 设置就绪标志
-   - 记录栈指针
-   - 记录初始栈指针
-   - 对于快速任务：设置上下文和标志
+1. 将参数 `sd` 加一，得到本次申请所需的空间块数。
+2. 从用户运行栈区域的起始位置开始扫描 `OS_MEMORY`。
+3. 根据位图中的对应位判断当前空间块是否已被占用。
+4. 连续遇到空闲块时，累积连续空闲块数量。
+5. 当连续空闲块数量满足申请要求时，将对应位图全部标记为占用。
+6. 根据分配位置计算初始栈指针 `SP`。
+7. 初始化对应任务类型的运行栈记录及入口地址。
 
-5. **完成**
-   - 返回成功（1）
-   - 任务现在准备好调度
+如果扫描过程中发现可用空间不足，函数返回 `-8`。
 
-## 任务删除流程
+位图以每字节八个标志位管理空间块。分配时使用 `0x80 >> OS_R0_PROTECT` 定位相应位，并将成功分配的连续空间标记为已占用。
 
-### 完整流程图
+### 标准任务注册
+
+标准任务的注册路径要求：
+
+- `sd` 不大于 `6`。
+- `OS_PROCESS_OK[id]` 为 `0`，即该编号未处于已注册状态。
+- 运行栈空间申请成功。
+
+注册成功后，函数更新以下信息：
+
+- `OS_JINCHENG_SP[id]`：记录任务栈指针相关信息。
+- `OS_JINCHENG_JILU_SP[id]`：记录初始栈指针。
+- `OS_PROCESS_OK[id]`：记录优先级、启动标记和栈空间大小等信息。
+
+随后，函数暂存当前系统栈指针，将 `SP` 切换到新任务的栈位置，把入口地址的低字节和高字节依次压入该任务的栈中，最后恢复原来的 `SP`。
+
+这一步为任务后续的运行入口建立初始栈内容。
+
+### 高速任务注册
+
+高速任务的注册路径要求 `sd` 不大于 `25`。运行栈申请成功后，函数通过 `id %= OS_FAST_TASK_MAX` 将编号映射到高速任务槽位。
+
+随后更新高速任务的栈指针、初始栈指针和栈空间记录，并根据任务槽位设置相应的启动标记：
+
+- 槽位 `0` 对应 `OS_KUAI_PROCESS_A`。
+- 其他槽位对应 `OS_KUAI_PROCESS_B`。
+
+同时，函数初始化 `OS_FAST_CONTEXT` 中的相关寄存器组信息，并将任务入口地址压入高速任务的运行栈。
+
+### 中断处理函数注册
+
+当 `pr` 等于 `OS_SCHED_LEVEL_MAX - 1` 时，函数将入口地址的低字节和高字节分别保存到 `OS_INTERRUPT_ADDR[0]` 和 `OS_INTERRUPT_ADDR[1]`。
+
+当 `pr` 等于 `OS_SCHED_LEVEL_MAX` 时，函数将入口地址保存到 `OS_INTERRUPT_ADDR2` 对应的两个字节中。
+
+这两条路径保存中断处理入口地址，不执行标准任务或高速任务的运行栈分配流程。
+
+### 创建操作的返回值
+
+| 返回值 | 含义 |
+|---:|---|
+| `1` | 注册成功 |
+| `-1` | 系统配置已锁定 |
+| `-2` | 优先级参数超过最大调度等级 |
+| `-3` | 任务编号无效 |
+| `-4` | 任务入口地址为空 |
+| `-5` | 标准任务栈参数无效 |
+| `-6` | 标准任务重复注册 |
+| `-7` | 高速任务栈参数无效 |
+| `-8` | 用户运行栈空间不足 |
+
+## 任务删除与清理流程
+
+### 删除请求与实际清理
+
+HRTOS 将任务删除后的资源回收放在 `os_task_cleanup()` 中执行。Idle 循环负责检查普通任务的 `DEAD` 状态，以及两个高速任务各自的删除请求标志。
+
+普通任务与高速任务采用不同的删除请求表示方式：
+
+- 普通任务通过 `OS_TASK[i].state == DEAD` 进入清理路径。
+- 高速任务 A 通过 `OS_KUAI_PROCESS_A_DEL` 标记删除请求。
+- 高速任务 B 通过 `OS_KUAI_PROCESS_B_DEL` 标记删除请求。
 
 ```mermaid
-sequenceDiagram
-    participant App as 应用程序
-    participant TD as task_delete
-    participant Idle as 空闲任务
-    participant TC as task_cleanup
-    participant BM as 位图管理器
-    participant Res as 资源管理器
-    participant Sched as 调度器
-
-    App->>TD: os_task_delete(id)
-    TD->>TD: 设置删除请求标志
-    TD->>Sched: 触发调度
-    Sched->>Idle: 上下文切换到空闲
-    Idle->>Idle: 检查删除请求
-    Idle->>TC: os_task_cleanup(id)
-    TC->>TC: 验证任务 ID
-    TC->>TC: 计算栈块
-    TC->>BM: 释放位图块
-    TC->>TC: 清除上下文保存区域
-    TC->>TC: 清除 OS_PROCESS_OK
-    TC->>Res: 从等待队列中移除
-    TC->>Res: 释放互斥锁所有权
-    TC->>TC: 清除 TCB 等待字段
-    TC->>TC: 设置状态为 DEAD
-    TC-->>Idle: 返回成功
-    Idle->>Idle: 继续空闲循环
+flowchart TD
+    A["进入 Idle 循环"] --> B["关闭总中断"]
+    B --> C["扫描任务编号 1 至 OS_PROCESS_MAX-1"]
+    C --> D{"任务状态是否为 DEAD"}
+    D -- 是 --> E["调用 os_task_cleanup(i)"]
+    D -- 否 --> F["检查下一个普通任务"]
+    E --> F
+    F --> G{"普通任务是否扫描完成"}
+    G -- 否 --> C
+    G -- 是 --> H{"高速任务 A 删除标志是否置位"}
+    H -- 是 --> I["清理高速任务 A"]
+    I --> J["清除 A 删除标志"]
+    H -- 否 --> K["检查高速任务 B"]
+    J --> K
+    K --> L{"高速任务 B 删除标志是否置位"}
+    L -- 是 --> M["清理高速任务 B"]
+    M --> N["清除 B 删除标志"]
+    L -- 否 --> O["开启总中断"]
+    N --> O
+    O --> P["执行 Idle Hook（若已注册）"]
+    P --> A
 ```
 
-### 详细步骤
+### 清理入口与合法性检查
 
-1. **删除请求**
-   - 设置 `OS_EVENT_DELETE_REQ` 标志
-   - 触发调度
-   - 任务继续直到被抢占
+`os_task_cleanup(id)` 根据任务编号选择相应的资源回收路径。
 
-2. **空闲任务检测**
-   - 空闲任务扫描删除请求
-   - 为每个请求调用 `os_task_cleanup()`
+函数首先拒绝以下请求：
 
-3. **栈释放**
-   - 计算栈块位置
-   - 清除位图中的位
-   - 释放栈空间
+- `id` 大于 `OS_PROCESS_MAX + 1`。
+- `id` 等于 `0`。
 
-4. **上下文清理**
-   - 清除上下文保存区域
-   - 清除栈指针
-   - 清除任务状态
+对于标准任务，函数要求 `OS_JINCHENG_JILU_SP[id]` 非零；对于两个高速任务，分别要求对应的 `OS_SP_KUAI_BEI` 记录非零。若相应运行栈记录不存在，则返回 `-1`。
 
-5. **资源清理**
-   - 从所有等待队列中移除
-   - 释放互斥锁所有权
-   - 清除挂起操作
+合法任务进入清理流程后，函数暂存当前 `OS_HRTOS` 值，待资源回收完成后恢复该值。
 
-6. **TCB 清理**
-   - 清除 wait_type
-   - 清除 wait_flag
-   - 清除 wait_obj
-   - 清除 wait_tick
-   - 设置状态为 DEAD
+### 运行栈与上下文清理
 
-## 调度流程
+标准任务与高速任务分别使用独立的栈记录和上下文数组。
 
-### 完整流程图
+标准任务清理过程包括：
+
+1. 调整栈记录中的兼容性计数。
+2. 根据栈记录和用户 RAM 起始地址计算待释放空间范围。
+3. 清除任务注册记录和初始栈指针记录。
+4. 将 `OS_TASK_CONTEXT[id]` 对应的上下文内容清零。
+
+高速任务清理过程则分别处理高速任务 A 或 B：
+
+1. 调整对应高速任务的栈空间记录。
+2. 根据初始栈指针计算待释放空间范围。
+3. 清除对应高速任务的启动标记。
+4. 清除高速任务栈指针及栈空间记录。
+5. 将对应的 `OS_FAST_CONTEXT` 内容清零。
+
+完成对应类型的记录清理后，函数根据计算出的空间范围遍历 `OS_MEMORY`，清除对应位图中的占用标记，从而释放运行栈空间。
+
+### 等待关系与资源所有权清理
+
+任务清理不仅回收运行栈，还要移除该任务在系统资源中的关联信息。
+
+函数遍历全部系统资源，对每个资源执行两项检查。
+
+**第一项：清除等待位图。**
+
+如果资源的 `wait_mask` 中包含当前任务的位，则清除该位；如果 `wait_cnt` 非零，同时将等待计数减一。
+
+**第二项：释放互斥资源所有权。**
+
+如果资源的 `owner` 等于待清理任务编号，则将 `owner` 设置为 `OS_INVALID_ID`。
+
+这一处理确保任务退出后，不再以等待者或资源所有者的身份保留在资源管理记录中。
+
+### 清理任务等待状态
+
+资源关系处理完成后，函数统一重置任务控制块中的等待字段：
+
+| 字段 | 清理后的值 |
+|---|---|
+| `wait_type` | `WAIT_NONE` |
+| `wait_flag` | `WAIT_TIMEOUT` |
+| `wait_obj` | `OS_INVALID_ID` |
+| `wait_tick` | `0` |
+| `state` | `READY` |
+
+对于高速任务，函数还会清零对应的 `OS_WAIT_DI2` 延时计数，防止遗留的延时状态再次激活该任务。
+
+最后，函数恢复进入清理流程前保存的 `OS_HRTOS`，并返回 `1` 表示清理成功。
+
+需要注意，`os_task_cleanup()` 完成的是任务资源与运行状态的重置；函数最终将任务状态设置为 `READY`，而不是 `DEAD`。
+
+## 任务等待流程
+
+### 等待机制概述
+
+`os_wait(type, obj, tick)` 是 HRTOS 统一的任务等待入口。函数通过等待类型、等待对象和等待时长描述任务的等待条件，并将相应信息保存到任务控制块中。
+
+对于普通任务，等待操作主要包括：
+
+1. 关闭总中断，进入临界区。
+2. 获取当前任务编号。
+3. 检查等待参数及当前等待状态。
+4. 保存等待类型、等待对象、等待时长和等待结果初值。
+5. 必要时将任务加入资源等待位图。
+6. 将任务状态设置为 `WAIT`，清除其运行资格标记。
+7. 设置调度请求标志，开启总中断并触发 Timer0 中断。
+8. 在任务后续恢复执行时，返回任务控制块中的等待结果。
+
+### 普通任务等待流程
 
 ```mermaid
-sequenceDiagram
-    participant Task as 运行任务
-    participant Wait as os_wait
-    participant TCB as TCB 更新
-    participant Res as 资源队列
-    participant ISR as Timer0 ISR
-    participant Sched as 调度器
-    participant Next as 下一个任务
-
-    Task->>Wait: os_wait(type, obj, tick)
-    Wait->>Wait: 进入临界区
-    Wait->>TCB: 设置 wait_type、wait_obj、wait_tick
-    Wait->>TCB: 设置状态为 WAIT
-    Wait->>Res: 添加到 wait_mask（如适用）
-    Wait->>TCB: 清除就绪标志
-    Wait->>ISR: 设置 OS_SCHED_REASON=1、TF0=1
-    Wait->>Wait: 退出临界区
-    Wait-->>Task: 返回（任务阻塞）
-    
-    Note over Task,ISR: 发生上下文切换
-    
-    ISR->>ISR: Timer0 溢出
-    ISR->>ISR: 检查 OS_SCHED_REASON
-    ISR->>Sched: 调用调度器
-    Sched->>Sched: 扫描就绪任务
-    Sched->>Sched: 选择最高优先级
-    Sched->>Next: 上下文切换到下一个任务
-    Next->>Next: 执行任务代码
+flowchart TD
+    A["调用 os_wait(type, obj, tick)"] --> B["关闭总中断 EA=0"]
+    B --> C["获取 OS_CURRENT_TASK"]
+    C --> D{"type 是否为 WAIT_DELAY"}
+    D -- 是 --> E{"tick 是否为 0"}
+    E -- 是 --> F["开启总中断并返回 WAIT_TIMEOUT"]
+    E -- 否 --> G["设置等待类型、对象、tick 和结果初值"]
+    G --> H["将任务状态设置为 WAIT"]
+    H --> I["清除 OS_PROCESS_OK 的运行标记"]
+    I --> J["设置 OS_SCHED_REASON"]
+    J --> K["开启总中断并触发 TF0"]
+    K --> L["任务恢复执行后返回 wait_flag"]
+    D -- 否 --> M{"当前任务是否已有等待类型"}
+    M -- 是 --> N["开启总中断并返回 0"]
+    M -- 否 --> O{"obj 是否超出资源范围"}
+    O -- 是 --> P["开启总中断并返回 0"]
+    O -- 否 --> Q["保存等待上下文"]
+    Q --> R["设置资源等待位图与等待计数"]
+    R --> S["将任务状态设置为 WAIT"]
+    S --> T["清除 OS_PROCESS_OK 的运行标记"]
+    T --> J
 ```
 
-### 详细步骤
+### 等待状态与资源等待位图
 
-1. **阻塞操作**
-   - 任务调用阻塞 API
-   - API 调用 `os_wait()`
-   - 进入临界区
+普通任务进入等待状态时，`os_wait()` 将以下字段写入 `OS_TASK[tid]`：
 
-2. **等待设置**
-   - 设置 TCB 等待字段
-   - 添加到资源等待队列
-   - 设置任务状态为 WAIT
-   - 清除就绪标志
+- `wait_type`：等待类型。
+- `wait_obj`：等待对象编号。
+- `wait_tick`：等待超时计数。
+- `wait_flag`：等待结果，进入等待时初始化为 `0`。
+- `state`：任务状态设置为 `WAIT`。
 
-3. **调度触发**
-   - 设置 `OS_SCHED_REASON = 1`
-   - 设置 `TF0 = 1`（触发 Timer0）
-   - 退出临界区
+对于非 `WAIT_DELAY` 类型的等待，如果 `obj` 不等于 `OS_INVALID_ID`，函数会在对应资源的 `wait_mask` 中设置当前任务的位，并将 `wait_cnt` 加一。
 
-4. **上下文切换**
-   - Timer0 ISR 触发
-   - 调度器扫描任务
-   - 选择最高优先级的就绪任务
-   - 发生上下文切换
+纯时间等待不需要进入资源等待位图。资源等待则通过对象编号建立任务与系统资源之间的关联关系。
 
-5. **任务执行**
-   - 下一个任务运行
-   - 前一个任务阻塞
+### 等待期间的调度触发
 
-## 唤醒流程
+任务进入等待状态后，函数通过以下操作请求任务重新调度：
 
-### 完整流程图
+```c
+OS_SCHED_REASON = 1;
+EA = 1;
+TF0 = 1;
+```
+
+`OS_SCHED_REASON` 用于记录调度请求，`TF0` 用于触发 Timer0 中断。`os_wait()` 本身不直接调用调度器。
+
+等待函数在设置等待状态后，继续返回 `OS_TASK[tid].wait_flag`。任务实际恢复执行时，会从该调用点继续执行并取得等待结果。
+
+### 等待结果
+
+在普通任务的等待路径中，等待结果保存在 `wait_flag` 中。
+
+| 返回值 | 含义 |
+|---|---|
+| `WAIT_TIMEOUT` | 等待超时 |
+| `WAIT_SIGNAL` | 通过资源或事件正常唤醒 |
+| `0` | 等待参数无效，或当前任务已经处于等待状态 |
+
+对于 `WAIT_DELAY` 且 `tick == 0` 的调用，函数直接返回 `WAIT_TIMEOUT`，不建立等待状态。
+
+### 高速任务的延时处理
+
+当等待类型为 `WAIT_DELAY` 时，函数会单独判断当前任务是否属于高速任务。高速任务不使用普通任务的统一等待字段和资源等待位图来处理延时，而是使用独立的启动标记和 `OS_WAIT_DI2` 计数。
+
+- 高速任务 A：清除 `OS_KUAI_PROCESS_A`，将延时时长写入 `OS_WAIT_DI2[0]`。
+- 高速任务 B：清除 `OS_KUAI_PROCESS_B`，将延时时长写入 `OS_WAIT_DI2[1]`。
+
+随后设置调度请求标志、开启总中断并触发 Timer0 中断。该分支在完成上述操作后直接返回 `WAIT_TIMEOUT`，延时计数由高速任务的独立管理路径处理。
+
+## 任务唤醒流程
+
+### 唤醒入口
+
+`wake_task(tid, flag)` 用于唤醒指定的普通任务，并将唤醒原因写入任务控制块。
+
+函数首先关闭总中断，读取任务原先关联的等待对象，并尝试清除该任务在对应资源中的等待位图及等待计数。随后检查任务是否已经删除或处于删除准备状态。
+
+如果任务可以继续唤醒处理，函数将等待结果设置为调用者提供的 `flag`，清除等待上下文，将任务恢复为就绪状态，并请求系统重新调度。
+
+### 唤醒流程图
 
 ```mermaid
-sequenceDiagram
-    participant ISR as ISR/Post
-    participant Res as 资源
-    participant Wake as wake_task
-    participant TCB as TCB 更新
-    participant Sched as 调度器
-    participant Task as 阻塞任务
-
-    ISR->>Res: Post 操作（sem_post、mutex_unlock 等）
-    Res->>Res: 更新资源状态
-    Res->>Wake: wake_task(tid, flag)
-    Wake->>Res: 从 wait_mask 中移除
-    Wake->>Res: 递减 wait_cnt
-    Wake->>TCB: 设置 wait_flag
-    Wake->>TCB: 清除 wait_type
-    Wake->>TCB: 清除 wait_obj
-    Wake->>TCB: 清除 wait_tick
-    Wake->>TCB: 设置状态为 READY
-    Wake->>TCB: 设置就绪标志
-    Wake->>Sched: 设置 OS_SCHED_REASON=1、TF0=1
-    Wake-->>Res: 返回
-    
-    Note over Res,Task: 发生上下文切换
-    
-    Sched->>Task: 任务被选中
-    Task->>Task: 恢复执行
-    Task->>Task: 检查 wait_flag
-    Task->>Task: 从 os_wait 返回
+flowchart TD
+    A["调用 wake_task(tid, flag)"] --> B["关闭总中断"]
+    B --> C["读取任务 wait_obj"]
+    C --> D{"wait_obj 是否有效"}
+    D -- 是 --> E["清除资源等待位图"]
+    E --> F["等待计数非零时减一"]
+    D -- 否 --> G["检查任务注册状态"]
+    F --> G
+    G --> H{"OS_PROCESS_OK[tid] 是否为 0"}
+    H -- 是 --> X["开启总中断并返回"]
+    H -- 否 --> I{"任务状态是否为 DEAD"}
+    I -- 是 --> X
+    I -- 否 --> J["写入 wait_flag"]
+    J --> K["清除等待类型、对象和 tick"]
+    K --> L["将任务状态设置为 READY"]
+    L --> M["恢复 OS_PROCESS_OK 运行标记"]
+    M --> N["设置 OS_SCHED_REASON"]
+    N --> O["开启总中断"]
+    O --> P["触发 TF0"]
+    P --> Q["结束唤醒处理"]
 ```
 
-### 详细步骤
+### 清理等待上下文
 
-1. **资源操作**
-   - ISR 或任务执行 post 操作
-   - 资源状态更新
-   - 识别等待任务
+对于允许唤醒的任务，`wake_task()` 会执行以下操作：
 
-2. **唤醒任务调用**
-   - 调用 `wake_task(tid, flag)`
-   - 临界区保护
+1. 将 `wait_flag` 设置为传入的 `flag`。
+2. 将 `wait_type` 设置为 `WAIT_NONE`。
+3. 将 `wait_obj` 设置为 `OS_INVALID_ID`。
+4. 将 `wait_tick` 清零。
+5. 将 `state` 设置为 `READY`。
+6. 通过 `OS_PROCESS_OK[tid] |= 1` 恢复任务的运行资格标记。
 
-3. **队列清理**
-   - 从 wait_mask 中移除任务
-   - 递减 wait_cnt
-   - 清除资源关联
+随后，函数设置 `OS_SCHED_REASON`，开启总中断并将 `TF0` 置位，触发后续调度处理。
 
-4. **TCB 更新**
-   - 设置 wait_flag（TIMEOUT 或 SIGNAL）
-   - 清除 wait_type
-   - 清除 wait_obj
-   - 清除 wait_tick
-   - 设置状态为 READY
-   - 在 `OS_PROCESS_OK` 中设置就绪标志
+### 已删除任务的处理
 
-5. **调度触发**
-   - 设置 `OS_SCHED_REASON = 1`
-   - 设置 `TF0 = 1`
-   - 任务将被调度
+当 `OS_PROCESS_OK[tid] == 0` 或 `OS_TASK[tid].state == DEAD` 时，函数不会继续修改任务的等待结果和就绪状态，而是开启总中断并直接返回。
 
-## 中断处理流程
+在这两种情况下，函数前面已经执行的资源等待位图检查仍然会发生。因此，唤醒入口不仅检查任务状态，还会先处理与该任务相关的等待记录。
 
-### 完整流程图
+## 调度请求流程
+
+### 调度请求接口
+
+`os_schedule_request(id)` 用于通知系统重新进行任务调度。
+
+该函数保留 `id` 参数供后续扩展使用，当前实现不根据该参数选择调度目标。函数的主要操作是设置调度请求标志并触发 Timer0 中断。
 
 ```mermaid
-sequenceDiagram
-    participant HW as 硬件
-    participant ISR as ISR 处理程序
-    participant API as ISR 安全 API
-    participant Res as 资源
-    participant Sched as 调度器
-    participant Task as 等待任务
-
-    HW->>ISR: 发生中断
-    ISR->>ISR: 保存上下文
-    ISR->>API: 调用 ISR 安全 API（event_set_from_isr 等）
-    API->>Res: 更新资源值
-    API->>Res: 递增 pending_signal
-    API->>Sched: os_schedule_request()
-    Sched->>Sched: 设置 OS_SCHED_REASON=1
-    Sched->>Sched: 设置 TF0=1
-    API-->>ISR: 返回
-    ISR->>ISR: 恢复上下文
-    ISR-->>HW: 返回
-    
-    Note over HW,Task: Timer0 中断触发
-    
-    Sched->>Task: 唤醒任务
-    Task->>Task: 处理事件
+flowchart TD
+    A["调用 os_schedule_request(id)"] --> B["保留 id 参数"]
+    B --> C["设置 OS_SCHED_REASON = 1"]
+    C --> D["设置 TF0 = 1"]
+    D --> E["返回 1"]
 ```
 
-### 详细步骤
+### 调度请求与任务切换的关系
 
-1. **中断入口**
-   - 发生硬件中断
-   - 硬件保存上下文
-   - ISR 处理程序执行
+HRTOS 将调度请求与调度执行分开处理。
 
-2. **ISR 安全 API 调用**
-   - 事件设置、信号量释放或消息发送
-   - 资源值更新
-   - 挂起信号递增
+| 阶段 | 主要操作 | 对应接口或机制 |
+|---|---|---|
+| 发起请求 | 设置调度请求标志 | `OS_SCHED_REASON = 1` |
+| 触发处理 | 置位 Timer0 中断标志 | `TF0 = 1` |
+| 执行调度 | 在中断处理链路中进行任务调度 | Timer0 中断处理路径 |
 
-3. **调度请求**
-   - 调用 `os_schedule_request()`
-   - 设置调度触发
-   - 触发 Timer0 中断
+`os_wait()`、`wake_task()` 和 `os_schedule_request()` 均采用这一请求方式，不在函数内部直接调用调度器。这样，任务等待、任务唤醒和其他调度请求可以通过统一的中断触发机制进入后续调度流程。
 
-4. **ISR 退出**
-   - 上下文恢复
-   - 从中断返回
+## 任务延时、唤醒与清理之间的关系
 
-5. **延迟调度**
-   - Timer0 中断触发
-   - 调度器处理唤醒
-   - 任务恢复
+任务延时、任务唤醒和任务清理都会影响任务的运行资格或等待状态，但它们承担不同的职责。
 
-## 延时流程
+| 操作 | 主要状态变化 | 后续处理 |
+|---|---|---|
+| 普通任务进入等待 | `state = WAIT`，清除运行资格标记 | 请求调度 |
+| 普通任务被唤醒 | `state = READY`，恢复运行资格标记 | 请求调度 |
+| 普通任务进入删除准备状态 | `state = DEAD` | Idle 循环检查并调用清理函数 |
+| 任务资源清理 | 清除等待关系、释放运行栈、重置控制块 | 恢复任务记录的初始状态 |
+| 高速任务延时 | 清除相应高速任务启动标记，记录独立延时计数 | 通过高速任务专用管理路径处理 |
 
-### 完整流程图
+普通任务的等待和唤醒主要围绕任务控制块及资源等待位图展开；高速任务的延时则使用独立的计数与启动标记。任务清理负责解除任务与资源之间的关联，避免已退出任务继续保留等待记录或互斥资源所有权。
 
-```mermaid
-sequenceDiagram
-    participant Task as 任务
-    participant Delay as os_delay
-    participant Wait as os_wait
-    participant TCB as TCB 更新
-    participant Timer as Timer0 ISR
-    participant Tick as 时钟处理程序
-    participant Wake as wake_task
+## 核心执行链总结
 
-    Task->>Delay: os_delay(tick)
-    Delay->>Wait: os_wait(WAIT_DELAY, INVALID_ID, tick)
-    Wait->>Wait: 进入临界区
-    Wait->>TCB: 设置 wait_type=WAIT_DELAY
-    Wait->>TCB: 设置 wait_tick=tick
-    Wait->>TCB: 设置状态=WAIT
-    Wait->>TCB: 清除就绪标志
-    Wait->>Timer: 设置 OS_SCHED_REASON=1、TF0=1
-    Wait->>Wait: 退出临界区
-    Wait-->>Delay: 返回
-    Delay-->>Task: 返回（任务阻塞）
-    
-    Note over Task,Timer: 任务阻塞，定时器中断
-    
-    Timer->>Tick: 时钟周期发生
-    Tick->>TCB: 递减 wait_tick
-    Tick->>Tick: wait_tick == 0?
-    Tick->>Wake: 是，调用 wake_task
-    Wake->>TCB: 设置状态=READY
-    Wake->>TCB: 设置就绪标志
-    Wake->>Timer: 设置 OS_SCHED_REASON=1
-    Wake-->>Tick: 返回
-    Tick-->>Timer: 返回
-    
-    Note over Timer,Task: 调度器选择任务
-    
-    Task->>Task: 恢复执行
-```
+HRTOS 的核心运行过程可以归纳为以下几条链路：
 
-### 详细步骤
+1. **系统启动链路**：`os_idle_task()` 初始化内核状态，调用 `hrtos_main()` 完成用户配置，然后锁定配置并进入 Idle 循环。
+2. **任务注册链路**：`os_task_create()` 检查配置与注册参数，为标准任务或高速任务分配运行栈，初始化任务运行记录；中断处理函数注册路径则保存对应入口地址。
+3. **任务等待链路**：`os_wait()` 保存等待条件，必要时建立资源等待关系，将普通任务设置为等待状态，并通过 Timer0 中断请求调度。
+4. **任务唤醒链路**：`wake_task()` 清理等待关系，设置唤醒结果，恢复任务就绪状态，并通过 Timer0 中断请求调度。
+5. **任务清理链路**：Idle 循环检查删除状态或删除请求，调用 `os_task_cleanup()` 释放运行栈空间、清除资源关联并重置任务记录。
+6. **调度请求链路**：调度请求接口设置 `OS_SCHED_REASON` 并触发 `TF0`，由后续中断处理链路执行调度。
 
-1. **延时调用**
-   - 任务调用 `os_delay(tick)`
-   - 调用 `os_wait(WAIT_DELAY, INVALID_ID, tick)`
+这些机制共同构成 HRTOS 的任务生命周期管理框架：任务先完成注册，再根据运行需求进入就绪或等待状态；等待条件满足后，任务恢复就绪资格；任务进入删除处理后，Idle 循环负责回收运行资源并清理相关状态。
 
-2. **等待设置**
-   - 设置 wait_type 为 WAIT_DELAY
-   - 设置 wait_tick 为 tick 值
-   - 无资源对象（INVALID_ID）
-   - 设置状态为 WAIT
-   - 清除就绪标志
-
-3. **调度触发**
-   - 设置调度触发
-   - 任务阻塞
-
-4. **时钟周期处理**
-   - 每次 Timer0 中断
-   - 递减 wait_tick
-   - 检查 wait_tick == 0
-
-5. **唤醒**
-   - 当 wait_tick 达到 0
-   - 使用 WAIT_TIMEOUT 调用 `wake_task()`
-   - 任务返回到 READY 状态
-
-6. **任务恢复**
-   - 调度器选择任务
-   - 任务恢复执行
-   - 从 `os_delay()` 返回
-
-## 互斥锁加锁流程
-
-### 完整流程图
-
-```mermaid
-sequenceDiagram
-    participant Task as 任务
-    participant Lock as mutex_lock
-    participant Res as 资源
-    participant Prio as 优先级继承
-    participant Wait as os_wait
-    participant TCB as TCB 更新
-
-    Task->>Lock: os_mutex_lock(mid)
-    Lock->>Lock: 验证参数
-    Lock->>Res: 检查所有者
-    Res-->>Lock: 所有者状态
-    Lock->>Lock: 当前任务所有者?
-    Lock-->>Task: 是，返回错误（无递归）
-    
-    alt 互斥锁空闲
-        Lock->>Res: 设置所有者 = 当前任务
-        Lock->>TCB: 设置 base_prio
-        Lock->>TCB: 设置 cur_prio
-        Lock-->>Task: 返回成功
-    else 互斥锁被持有
-        Lock->>Prio: 检查优先级
-        Prio->>TCB: 获取当前任务优先级
-        Prio->>TCB: 获取所有者优先级
-        alt 等待任务优先级更高
-            Prio->>TCB: 提升所有者 cur_prio
-            Prio->>TCB: 更新 OS_PROCESS_OK
-        end
-        Lock->>Wait: os_wait(WAIT_MUTEX, mid, 0)
-        Wait->>TCB: 设置 wait_type=WAIT_MUTEX
-        Wait->>Res: 添加到 wait_mask
-        Wait->>TCB: 设置状态=WAIT
-        Lock-->>Task: 返回（进入等待队列）
-    end
-```
-
-### 详细步骤
-
-1. **加锁请求**
-   - 任务调用 `os_mutex_lock(mid)`
-   - 验证互斥锁 ID
-
-2. **递归检查**
-   - 检查当前任务是否为所有者
-   - 如果是，返回错误（无递归锁）
-
-3. **空闲互斥锁**
-   - 如果互斥锁空闲（所有者 = INVALID_ID）
-   - 将所有者设置为当前任务
-   - 设置任务优先级
-   - 立即返回成功
-
-4. **被持有的互斥锁**
-   - 如果互斥锁被另一个任务持有
-   - 检查优先级继承
-   - 如果等待任务优先级更高：
-     - 提升所有者优先级
-     - 更新所有者的 `OS_PROCESS_OK`
-   - 调用 `os_wait(WAIT_MUTEX, mid, 0)`
-   - 添加到等待队列
-   - 返回（任务阻塞）
-
-## 信号量等待流程
-
-### 完整流程图
-
-```mermaid
-sequenceDiagram
-    participant Task as 任务
-    participant Wait as sem_wait
-    participant Res as 资源
-    participant WaitCore as os_wait
-    participant TCB as TCB 更新
-
-    Task->>Wait: os_sem_wait(sid)
-    Wait->>Res: 检查值
-    Res-->>Wait: 值状态
-    
-    alt value > 0（快速路径）
-        Wait->>Res: 递减值
-        Wait-->>Task: 返回 WAIT_SIGNAL
-    else value == 0（慢速路径）
-        Wait->>WaitCore: os_wait(WAIT_SEM, sid, 0)
-        WaitCore->>TCB: 设置 wait_type=WAIT_SEM
-        WaitCore->>Res: 添加到 wait_mask
-        WaitCore->>TCB: 设置状态=WAIT
-        WaitCore->>TCB: 清除就绪标志
-        WaitCore-->>Wait: 返回（阻塞）
-        Wait-->>Task: 返回任务 ID
-    end
-```
-
-### 详细步骤
-
-1. **信号量等待**
-   - 任务调用 `os_sem_wait(sid)`
-   - 进入临界区
-
-2. **快速路径检查**
-   - 检查 value > 0
-   - 如果是：
-     - 递减值
-     - 立即返回 WAIT_SIGNAL
-     - 无阻塞，无上下文切换
-
-3. **慢速路径**
-   - 如果 value == 0
-   - 调用 `os_wait(WAIT_SEM, sid, 0)`
-   - 设置 wait_type
-   - 添加到 wait_mask
-   - 设置状态为 WAIT
-   - 任务阻塞
-
-4. **唤醒**
-   - 当调用 `os_sem_post()` 时
-   - 使用 WAIT_SIGNAL 唤醒任务
-   - 从 `os_sem_wait()` 返回
-
-## 消息队列发送流程
-
-### 完整流程图
-
-```mermaid
-sequenceDiagram
-    participant Task as 任务
-    participant Send as msgq_send
-    participant Queue as 队列结构
-    participant Wait as os_wait
-    participant Wake as wake_task
-
-    Task->>Send: os_msgq_send(q, obj, data, nonblock)
-    Send->>Queue: 检查计数与大小
-    Queue-->>Send: 队列状态
-    
-    alt 队列未满
-        Send->>Queue: 在 head 写入数据
-        Send->>Queue: 递增 head
-        Send->>Queue: 递增 count
-        Send->>Queue: 接收者等待?
-        alt 是
-            Send->>Wake: wake_task(receiver_id)
-            Wake->>Queue: 从 wait_mask 中移除
-            Wake->>Queue: 设置状态=READY
-        end
-        Send-->>Task: 返回成功
-    else 队列已满
-        alt nonblock == 1
-            Send-->>Task: 返回失败
-        else nonblock == 0
-            Send->>Wait: os_wait(WAIT_MSG_SEND, obj, 0)
-            Wait->>Queue: 添加到 wait_mask
-            Wait->>Queue: 设置状态=WAIT
-            Send-->>Task: 返回（阻塞）
-        end
-    end
-```
-
-### 详细步骤
-
-1. **发送请求**
-   - 任务调用 `os_msgq_send()`
-   - 检查队列状态
-
-2. **队列未满**
-   - 在 head 处将数据写入缓冲区
-   - 递增 head（带环绕）
-   - 递增 count
-   - 检查接收者是否等待
-   - 如果是，唤醒接收者
-   - 返回成功
-
-3. **队列已满**
-   - 检查 nonblock 标志
-   - 如果非阻塞：返回失败
-   - 如果阻塞：
-     - 调用 `os_wait(WAIT_MSG_SEND, obj, 0)`
-     - 添加到发送者等待队列
-     - 任务阻塞
-
-4. **唤醒**
-   - 当接收者消费消息时
-   - 空间变为可用
-   - 发送者被唤醒
-   - 发送操作完成
-
-## 调用流程摘要
-
-### 常见模式
-
-1. **阻塞操作**：所有阻塞操作通过 `os_wait()`
-2. **唤醒**：所有唤醒通过 `wake_task()`
-3. **调度**：通过 Timer0 中断触发调度
-4. **临界区**：所有状态更改由临界区保护
-
-### 性能考虑
-
-- **快速路径**：许多操作具有快速路径优化
-- **上下文切换**：阻塞操作导致上下文切换
-- **临界区**：临界区中的时间最小
-- **ISR 安全**：ISR 操作延迟到任务上下文
-
-### 调试调用流程
-
-- **跟踪函数调用**：在关键函数处添加断点
-- **监视状态**：观察 TCB 和资源状态更改
-- **检查触发**：验证调度触发
-- **验证转换**：确保状态转换正确
